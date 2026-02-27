@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+matplotlib
+scikit-learn
+statsmodels
+prophet
+xgboost
+tensorflow
+shap
+sqlalchemy
+fastapi
+uvicorn
+mlflow
