@@ -6,7 +6,7 @@ import numpy as np
 from models.sarima_model import train_sarima
 from models.prophet_model import train_prophet
 from models.xgb_model import train_xgb, DEFAULT_LAG
-from models.lstm_model import train_lstm
+from models.lstm_model import train_lstm, forecast_with_lstm, load_lstm, DEFAULT_LOOK_BACK
 
 from utils.metrics import evaluate
 from utils.cross_validation import time_series_cv
@@ -78,7 +78,7 @@ class ForecastPipeline:
         self.xgb_model, self.xgb_pred = train_xgb(self.train, len(self.test))
 
         # LSTM
-        self.lstm_model, self.lstm_pred = train_lstm(self.train, len(self.test))
+        self.lstm_model, self.lstm_pred, self.lstm_scaler = train_lstm(self.train, len(self.test))
 
     # ---------------------------------------------------------
     # WEIGHTED ENSEMBLE
@@ -139,22 +139,24 @@ class ForecastPipeline:
         best_model = min(results, key=lambda x: results[x]["RMSE"])
         self.best_model_name = best_model
 
-        if best_model == "XGBoost":
-            self.best_model_object = self.xgb_model
-        elif best_model == "LSTM":
-            self.best_model_object = self.lstm_model
-        else:
-            self.best_model_object = None  # Prophet/SARIMA retrain on full series to forecast
-
         # -------------------------------------------------
         # PERSIST FORECAST ARTIFACT (for API usage)
         # -------------------------------------------------
-        # FIXED: the old version only saved a model file when XGBoost or
-        # LSTM won, which meant api.py had nothing to load whenever Prophet
-        # or SARIMA won instead (Prophet wins in this project's own
-        # benchmark results). We now always persist a self-contained
-        # artifact, and forecast_from_artifact() below knows how to serve
-        # a forecast from ANY of the four model types.
+        # Two fixes from the original version:
+        #
+        # 1. The old code only saved a model file when XGBoost or LSTM won,
+        #    so api.py had nothing to load whenever Prophet or SARIMA won
+        #    instead (Prophet wins in this project's own benchmark table).
+        #    We now always persist a self-contained artifact, and
+        #    forecast_from_artifact() below can serve a forecast from ANY
+        #    of the four model types.
+        #
+        # 2. The old code saved the model as trained on the 80% train
+        #    split used for benchmarking. Standard practice is to use that
+        #    split only to PICK the winner, then refit on the FULL series
+        #    before shipping it — exactly what forecast_future() already
+        #    does. We do the same here so the persisted model has seen as
+        #    much data as possible.
         os.makedirs("models", exist_ok=True)
 
         artifact = {
@@ -164,18 +166,24 @@ class ForecastPipeline:
         }
 
         if best_model == "XGBoost":
-            artifact["xgb_model"] = self.xgb_model
+            # forecast_steps=1 is a throwaway value here — we only need the
+            # refit model, not this particular prediction.
+            full_model, _ = train_xgb(self.series, forecast_steps=1)
+            artifact["xgb_model"] = full_model
+            self.best_model_object = full_model
 
         elif best_model == "LSTM":
-            # Keras models aren't always reliably joblib-picklable across
-            # TensorFlow versions — save in Keras' native format and store
-            # just the path in the artifact instead.
+            full_model, _, full_scaler = train_lstm(self.series, forecast_steps=1)
             lstm_path = "models/lstm_model.keras"
-            try:
-                self.lstm_model.save(lstm_path)
-                artifact["lstm_model_path"] = lstm_path
-            except Exception:
-                artifact["lstm_model"] = self.lstm_model  # best-effort fallback
+            scaler_path = "models/lstm_scaler.pkl"
+            full_model.save(lstm_path)
+            joblib.dump(full_scaler, scaler_path)
+            artifact["lstm_model_path"] = lstm_path
+            artifact["lstm_scaler_path"] = scaler_path
+            self.best_model_object = full_model
+
+        else:
+            self.best_model_object = None  # Prophet/SARIMA retrain on demand at forecast time
 
         joblib.dump(artifact, "models/forecast_artifact.pkl")
 
@@ -212,7 +220,7 @@ class ForecastPipeline:
 
         elif self.best_model_name == "LSTM":
 
-            model, future_pred = train_lstm(self.series, steps)
+            model, future_pred, _ = train_lstm(self.series, steps)
 
         else:
             future_pred = None
@@ -254,13 +262,13 @@ def forecast_from_artifact(artifact: dict, steps: int) -> np.ndarray:
         return np.array(preds)
 
     elif best_model_name == "LSTM":
-        # TODO: wire this up once models/lstm_model.py's exact windowing
-        # and scaling logic is available — it must match train_lstm() or
-        # predictions will be silently wrong.
-        raise NotImplementedError(
-            "LSTM serving not yet implemented — needs models/lstm_model.py "
-            "to mirror its windowing/scaling logic here."
-        )
+        model = load_lstm(artifact["lstm_model_path"])
+        scaler = joblib.load(artifact["lstm_scaler_path"])
+
+        scaled_series = scaler.transform(series.reshape(-1, 1))
+        last_window = scaled_series[-DEFAULT_LOOK_BACK:]
+
+        return forecast_with_lstm(model, scaler, last_window, steps, DEFAULT_LOOK_BACK)
 
     else:
         raise ValueError(f"Unknown model type: {best_model_name}")
