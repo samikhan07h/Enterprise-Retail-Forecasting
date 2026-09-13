@@ -224,18 +224,23 @@ if df is not None and not df.empty:
             st.subheader("🔎 XGBoost Explainability")
             imp_col, shap_col = st.columns(2)
 
+            from models.xgb_model import create_features, DEFAULT_LAG
+            feature_names = [f"lag_{DEFAULT_LAG - i}" for i in range(DEFAULT_LAG)]
+
             with imp_col:
                 st.caption("Feature importance")
-                st.bar_chart(pipeline.xgb_model.feature_importances_)
+                importance = pd.Series(
+                    pipeline.xgb_model.feature_importances_, index=feature_names
+                )
+                st.bar_chart(importance)
 
             with shap_col:
                 st.caption("SHAP summary")
                 try:
                     import shap
-                    from models.xgb_model import create_features
 
                     X_sample, _ = create_features(pipeline.train)
-                    X_sample = X_sample[:100]
+                    X_sample = pd.DataFrame(X_sample[:100], columns=feature_names)
 
                     explainer = shap.TreeExplainer(pipeline.xgb_model)
                     shap_values = explainer.shap_values(X_sample)
