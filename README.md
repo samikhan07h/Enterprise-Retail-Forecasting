@@ -6,23 +6,21 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-Production_API-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-An **end-to-end, production-grade retail demand forecasting platform** featuring multi-model benchmarking, experiment tracking, explainability, and deployment-ready infrastructure.
-
-Built with a full ML engineering mindset — from raw data ingestion to a live, monitored API.
+An **end-to-end retail demand forecasting platform** with multi-model benchmarking, experiment tracking, SHAP explainability, and a FastAPI serving layer — built to demonstrate real ML engineering practice, not just notebook-level modeling.
 
 ---
 
 ## 📌 Overview
 
-This platform forecasts retail demand using multiple complementary modeling paradigms, then automatically selects the best-performing model based on cross-validated error metrics.
+The platform trains five forecasting approaches on a single sales time series, benchmarks them on a held-out split, then **refits the winning model on the full dataset** before persisting it for serving:
 
-| Approach | Model | Why it's included |
+| Approach | Model | Notes |
 |---|---|---|
-| 📈 Statistical | SARIMA | Captures seasonality & trend in classical time series |
-| 🔮 Additive decomposition | Prophet | Robust to missing data & holiday effects |
-| 🌲 Gradient Boosting | XGBoost | Captures non-linear feature interactions |
-| 🧠 Deep Learning | LSTM | Learns long-range temporal dependencies |
-| 🧮 Ensemble | Weighted blend | Combines model strengths, reduces variance |
+| 📈 Statistical | SARIMA | `order=(1,1,1)`, weekly seasonality (`s=7`) — assumes **daily-frequency** data |
+| 🔮 Additive decomposition | Prophet | Weekly seasonality always on; yearly seasonality only enabled with ≥365 data points |
+| 🌲 Gradient Boosting | XGBoost | 14-lag sliding window regression (see [Feature Engineering](#-feature-engineering) below) |
+| 🧠 Deep Learning | LSTM | 14-step lookback window, single LSTM(50) layer, `MinMaxScaler`-normalized |
+| 🧮 Ensemble | Weighted blend | Inverse-RMSE weighted average of the four models above |
 
 ---
 
@@ -32,10 +30,10 @@ This platform forecasts retail demand using multiple complementary modeling para
 Data Source (CSV / SQL)
         │
         ▼
-Data Preprocessing
+Data Preprocessing (groupby date, sum sales)
         │
         ▼
-Feature Engineering (Lag, Rolling, Date Features)
+Train/Test Split (80/20, min. 30 data points)
         │
         ▼
 Model Training
@@ -46,20 +44,32 @@ Model Training
    └── Ensemble
         │
         ▼
-Time-Series Cross-Validation
+Evaluation (MAE, RMSE, MAPE) + Cross-Validation (SARIMA only)
         │
         ▼
-Evaluation (MAE, RMSE, MAPE, CV_RMSE)
+Best Model Selection (lowest RMSE)
         │
         ▼
-MLflow Tracking
+Refit Winner on FULL Series ──▶ Persist to models/forecast_artifact.pkl
         │
         ▼
-Model Selection
+MLflow Logging
         │
         ▼
-API Deployment (FastAPI) ──▶ Streamlit Dashboard
+Streamlit Dashboard ◀──────────────▶ FastAPI (/predict)
 ```
+
+---
+
+## 🧮 Feature Engineering
+
+> **Note:** earlier drafts of this README described "Lag, Rolling, and Date" features. The actual implementation is **lag-only** — this section reflects the real code.
+
+XGBoost is trained on a pure sliding-window representation: for a lag of 14, each training row is the previous 14 sales values, with the 15th as the target. Forecasting beyond the training data is done **recursively** — each prediction is fed back into the window to produce the next one, which means small errors can compound over longer horizons.
+
+LSTM uses the same 14-step lookback idea, but on `MinMaxScaler`-normalized data through a single-layer LSTM network.
+
+**Not currently implemented:** rolling statistics (e.g. 7-day rolling mean) and calendar/date features (day-of-week, month, holiday flags). Adding these to `models/xgb_model.py`'s `create_features()` is a natural next step and would likely improve XGBoost's accuracy — see [Future Improvements](#-future-improvements).
 
 ---
 
@@ -73,46 +83,40 @@ API Deployment (FastAPI) ──▶ Streamlit Dashboard
 | LSTM      | 12,152.29 | 13,896.61 | 38.16    | —         |
 | SARIMA    | 22,992.37 | 25,475.16 | 74.92    | 39,431.57 |
 
-> **Best Model (lowest RMSE): Prophet**
+> **Best Model (lowest RMSE): Prophet.** Results will vary by dataset — re-run the pipeline on your own data to get benchmark numbers specific to it.
 >
-> *Note: CV_RMSE is currently only computed for SARIMA. Extending rolling-window cross-validation to all models is tracked in [Future Improvements](#-future-improvements).*
+> *CV_RMSE is currently only computed for SARIMA via rolling-window cross-validation. Extending this to all models is tracked in [Future Improvements](#-future-improvements).*
 
 ---
 
 ## 🧠 Explainability
 
-[SHAP](https://shap.readthedocs.io/) (SHapley Additive exPlanations) is integrated for the XGBoost model to:
+[SHAP](https://shap.readthedocs.io/) is integrated for XGBoost only (the other model types don't expose a comparable per-prediction feature attribution in this implementation):
 
-- Identify global and per-prediction feature importance
-- Quantify the influence of lag and rolling-window features
-- Explain key demand drivers to business stakeholders
-- Improve overall model transparency and trust
+- Per-lag feature importance (`lag_14` … `lag_1`)
+- SHAP summary plot over a 100-row sample of the training window
+- Both are skipped automatically if XGBoost isn't the winning model for a given run
 
 ---
 
 ## 📈 Cross-Validation Strategy
 
-Time-series cross-validation uses a **rolling-window split** to ensure realistic evaluation:
+Time-series cross-validation uses a rolling-window split for SARIMA:
 
 - Preserves temporal order (no shuffling)
 - Prevents data leakage from future to past
-- Produces a robust, generalizable CV_RMSE metric
+- Produces a `CV_RMSE` metric alongside the standard holdout RMSE
 
 ---
 
-## 🗄️ Data Sources
+## 🗄️ Data Requirements
 
-The platform supports two ingestion modes:
-
-- **CSV upload** — compatible with the Kaggle Retail Dataset format
-- **SQL database connection** — via `database.py`
-
-**Expected schema:**
-
-| Column | Type | Description |
-|---|---|---|
-| `date`  | datetime | Observation date |
-| `sales` | float    | Target variable to forecast |
+| Requirement | Value |
+|---|---|
+| Minimum data points | **30** (enforced — the pipeline raises a clear error below this) |
+| Assumed frequency | **Daily.** Weekly/monthly data will run without erroring, but SARIMA's seasonal period (7) and Prophet's future-dataframe frequency won't align correctly with the actual cadence. |
+| Required columns | A date column and a numeric sales/target column (auto-detected by name, with a manual override in the dashboard if detection fails) |
+| Ingestion modes | CSV upload, or SQL query via `database.py` |
 
 ---
 
@@ -121,18 +125,30 @@ The platform supports two ingestion modes:
 ```
 Enterprise-Retail-Forecasting/
 │
-├── app.py                # Streamlit dashboard
-├── pipeline.py            # Main ML pipeline
-├── api.py                 # FastAPI production API
-├── database.py             # SQL connection handler
-├── mlflow_utils.py          # MLflow tracking logic
+├── app.py                     # Streamlit dashboard
+├── pipeline.py                 # ForecastPipeline + forecast_from_artifact()
+├── api.py                      # FastAPI serving layer
+├── database.py                  # SQL connection handler
+├── mlflow_utils.py               # MLflow tracking logic
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 │
-├── models/                # Saved model artifacts
-├── utils/                  # Helper utilities
-└── mlruns/                 # MLflow tracking logs
+├── models/
+│   ├── sarima_model.py
+│   ├── prophet_model.py
+│   ├── xgb_model.py            # create_features, DEFAULT_LAG
+│   ├── lstm_model.py            # forecast_with_lstm, DEFAULT_LOOK_BACK
+│   ├── forecast_artifact.pkl    # generated at runtime — the winning model + data
+│   ├── lstm_model.keras          # generated only if LSTM wins
+│   └── lstm_scaler.pkl           # generated only if LSTM wins
+│
+├── utils/
+│   ├── cross_validation.py
+│   ├── metrics.py
+│   └── shap_explainer.py
+│
+└── mlruns/                     # MLflow tracking logs
 ```
 
 ---
@@ -157,10 +173,12 @@ pip install -r requirements.txt
 ```
 
 ### 4️⃣ Configure secrets
-Copy the example env file and fill in your own credentials — **never commit real secrets**:
 ```bash
 cp .env.example .env
+# For Streamlit specifically:
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
+Fill in real values in the copies — **never commit `.env` or `secrets.toml`**.
 
 ---
 
@@ -170,38 +188,30 @@ cp .env.example .env
 ```bash
 streamlit run app.py
 ```
-Access at → [http://localhost:8501](http://localhost:8501)
+→ [http://localhost:8501](http://localhost:8501)
 
-### FastAPI Production Server
+### FastAPI Serving Layer
 ```bash
 uvicorn api:app --reload
 ```
-Access interactive API docs at → [http://localhost:8000/docs](http://localhost:8000/docs)
+→ Interactive docs at [http://localhost:8000/docs](http://localhost:8000/docs)
+
+**API contract:** `POST /predict` takes `{"horizon": <int, 1-90>}` and returns `{"model": <winning model name>, "predictions": [...]}`. It does **not** accept live sales data — it forecasts forward from wherever the last dashboard run's training series ended. Re-run the dashboard's pipeline to refresh the underlying artifact. `GET /health` reports whether a trained artifact is currently available.
 
 ### MLflow Experiment Tracking
 ```bash
 mlflow ui
 ```
-Access at → [http://localhost:5000](http://localhost:5000)
-
-Tracks: parameters, metrics, model versions, and artifacts.
+→ [http://localhost:5000](http://localhost:5000)
 
 ---
 
 ## 🐳 Docker Deployment
 
-**Build the image:**
 ```bash
 docker build -t retail-forecasting .
-```
-
-**Run the container:**
-```bash
 docker run -p 8501:8501 retail-forecasting
-```
-
-**Or use Docker Compose:**
-```bash
+# or
 docker-compose up --build
 ```
 
@@ -209,57 +219,51 @@ docker-compose up --build
 
 ## 🔐 Secrets & Configuration
 
-This project reads sensitive configuration (DB credentials, API tokens, etc.) from environment variables rather than hard-coded values.
-
-- **Local development:** use a `.env` file (excluded via `.gitignore`)
-- **Streamlit Cloud:** use the built-in **Secrets manager** (`App settings → Secrets`), written in TOML:
+- **Local development:** `.env` (Docker/API) and `.streamlit/secrets.toml` (dashboard) — both git-ignored
+- **Streamlit Cloud:** App settings → Secrets, TOML format:
   ```toml
-  DB_USERNAME = "myuser"
-  DB_TOKEN = "your-token-here"
-
-  [some_section]
-  some_key = 1234
+  [database]
+  connection_string = "postgresql://user:password@host:port/dbname"
   ```
-- **Docker/production:** inject secrets via environment variables or a secrets manager (AWS Secrets Manager, Azure Key Vault, HashiCorp Vault, etc.)
+- **Docker/production:** inject via environment variables or a secrets manager (AWS Secrets Manager, Azure Key Vault, HashiCorp Vault, etc.)
 
-> ⚠️ Never commit real credentials to the repository. Rotate any key immediately if it is accidentally pushed to version control.
+> ⚠️ Never commit real credentials. Rotate immediately if one is accidentally pushed.
+
+---
+
+## ⚠️ Known Limitations
+
+- **Daily-frequency assumption** in SARIMA and Prophet (see [Data Requirements](#-data-requirements))
+- **Feature engineering is lag-only** for XGBoost — no rolling stats or calendar features yet
+- **Recursive multi-step forecasting** (XGBoost, LSTM) compounds error over longer horizons; accuracy degrades the further out you forecast
+- **SHAP explainability is XGBoost-only** — no comparable explanation is generated for the other model types
+- **Cross-validation is SARIMA-only** — other models are evaluated on a single holdout split
+- **The API serves one artifact at a time** — it reflects whichever model won the most recent dashboard run, not a per-request choice
 
 ---
 
 ## 📈 Key Features
 
 - ✔ Multi-model benchmarking across statistical, ML, and DL approaches
-- ✔ Automated best-model selection based on RMSE
-- ✔ Rolling-window cross-validation scoring
-- ✔ SHAP-based explainability
-- ✔ LSTM deep learning integration
-- ✔ Ensemble forecasting
-- ✔ Production-ready FastAPI deployment
+- ✔ Automatic refit-on-full-data before persisting the winning model
+- ✔ SHAP explainability for XGBoost
+- ✔ FastAPI serving layer with a documented, versioned contract
 - ✔ Dockerized, reproducible environment
 - ✔ MLflow experiment tracking
-- ✔ Flexible SQL + CSV data ingestion
-
----
-
-## 🎯 Business Impact
-
-- Detect seasonality and demand trends early
-- Reduce inventory overstock and stockouts
-- Improve demand planning accuracy
-- Compare model reliability objectively before deployment
-- Enable scalable, repeatable forecasting infrastructure
+- ✔ Flexible SQL + CSV ingestion with secrets-based DB credentials
 
 ---
 
 ## 🧪 Future Improvements
 
-- [ ] Extend rolling-window cross-validation to all models (not just SARIMA)
+- [ ] Add rolling-window and calendar (day-of-week, month, holiday) features to XGBoost
+- [ ] Extend cross-validation to all models, not just SARIMA
+- [ ] Auto-detect or let users specify data frequency instead of assuming daily
 - [ ] Hyperparameter tuning with Optuna
-- [ ] CI/CD pipeline (GitHub Actions) for automated testing & deployment
+- [ ] CI/CD pipeline (GitHub Actions)
 - [ ] Cloud deployment (AWS / GCP / Azure)
-- [ ] Real-time streaming forecasts
-- [ ] Model registry & versioning (MLflow Model Registry)
-- [ ] Unit & integration test coverage
+- [ ] MLflow Model Registry integration
+- [ ] Unit test coverage for `pipeline.py` and each `models/*.py`
 
 ---
 
@@ -267,16 +271,11 @@ This project reads sensitive configuration (DB credentials, API tokens, etc.) fr
 
 **Md Sami Ahmad**
 B.Tech CSE (Data Science & ML)
-Focused on building production-grade ML systems.
 
-[GitHub](https://github.com/samikhan07h) · [LinkedIn](#) · [Portfolio](#)
+[GitHub](https://github.com/samikhan07h)
 
 ---
 
 ## 📄 License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
----
-
-### ⭐ If you find this project useful, consider giving it a star on GitHub!
+MIT — see [LICENSE](LICENSE).
